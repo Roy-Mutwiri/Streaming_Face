@@ -12,7 +12,7 @@ import modules.processors.frame.core # This is for processing video frames
 from modules.face_analyser import get_one_face, get_many_faces, get_one_face_left, get_one_face_right, get_face_analyser, get_many_faces_fast, prepare_source_faces
 from modules.accel import get_providers
 from modules.face_restore import restore_face, restore_faces
-from modules.face_masks import build_mask, match_tone
+from modules.face_masks import build_mask, match_tone, estimate_noise
 from concurrent.futures import ThreadPoolExecutor
 from modules.temporal import FaceSmoother
 from insightface.utils import face_align
@@ -388,11 +388,12 @@ def _process_face_swap(frame: Frame, source_face: List[Face], target_face: Face,
     # Restore facial detail lost by the 128px model. Always done on the full frame: the restorer's
     # aligned crop covers the whole head, which reaches far outside the face crop used above.
     if modules.globals.live_enhancer != 'Off' and target_face.kps is not None:
+        grain = estimate_noise(cropped_frame) if modules.globals.grain_match else 0.0 # Noise of the original face
         deferred = getattr(DEFERRED_RESTORE, 'kps_list', None)
         if deferred is not None:
-            deferred.append(np.asarray(target_face.kps, dtype=np.float32)) # Restored later on the live restore thread
+            deferred.append((np.asarray(target_face.kps, dtype=np.float32), grain)) # Restored later on the live restore thread
         else:
-            frame = restore_face(frame, target_face.kps, model_name=modules.globals.file_enhancer) # Files: highest quality restorer
+            frame = restore_face(frame, target_face.kps, model_name=modules.globals.file_enhancer, grain=grain) # Files: highest quality restorer
     return frame
 
 def _apply_mouth_masks(frame: Frame, target_faces: List[Face], mouth_masks: List[Tuple[np.ndarray, np.ndarray, tuple, tuple]], face_masks: List[np.ndarray]) -> Frame:
@@ -805,31 +806,40 @@ def _process_face_tracking_many(
         else:
             return frame # If we have max faces then do not update the faces
 
-def process_frame(source_face: List[Face], temp_frame: Frame) -> Frame:
-    """Main function to process a single frame."""
-    global first_face_embedding, second_face_embedding, first_face_position, second_face_position
-    global first_face_id, second_face_id
-    global first_face_lost_count, second_face_lost_count
-    # Optimization Globals
+def detect_frame_faces(temp_frame: Frame) -> Tuple[List[Face], int]:
+    """
+    Detection step of process_frame: returns (faces, rotation used). Live runs it one frame ahead
+    on its own thread, so detection overlaps the previous frame's swap.
+    """
     global detection_frame_counter, cached_detected_faces
-
-    # Rotate the frame
-    temp_frame = _rotate_frame(temp_frame, modules.globals.face_rot_range)
+    rotation = modules.globals.face_rot_range
+    rotated = _rotate_frame(temp_frame, rotation)
 
     # --- OPTIMIZATION: DETECTION SKIPPING ---
-    # Only run heavy face detection once every 3 frames.
+    # Only run heavy face detection once every N frames.
     # On the frames in between, use the cached faces.
     detection_frame_counter += 1
-    
-    # If the counter is 0 (first run) or it's the 3rd frame, OR we don't have cached faces yet
+
+    # If the counter is 0 (first run) or it's the Nth frame, OR we don't have cached faces yet
     if detection_frame_counter % modules.globals.detection_frequency == 0 or not cached_detected_faces:
-        all_faces = _detect_faces(temp_frame)
+        all_faces = _detect_faces(rotated)
         # Update cache regardless. If no faces found, cache becomes empty.
         cached_detected_faces = all_faces
     else:
         # Use the faces found in the previous frame
         all_faces = cached_detected_faces
-    # ----------------------------------------
+    return all_faces, rotation
+
+def process_frame(source_face: List[Face], temp_frame: Frame, detected: Optional[Tuple[List[Face], int]] = None) -> Frame:
+    """Main function to process a single frame. `detected` is detect_frame_faces' result, if already run."""
+    global first_face_embedding, second_face_embedding, first_face_position, second_face_position
+    global first_face_id, second_face_id
+    global first_face_lost_count, second_face_lost_count
+
+    all_faces, rotation = detected if detected is not None else detect_frame_faces(temp_frame)
+
+    # Rotate the frame
+    temp_frame = _rotate_frame(temp_frame, rotation)
 
     # Handle face tracking reset logic
     if modules.globals.face_tracking: # If we're using face tracking
@@ -909,7 +919,7 @@ def process_frame(source_face: List[Face], temp_frame: Frame) -> Frame:
     # Deferred restoration only works on the plain swapped frame. With rotation, landmark
     # drawing or filters, restore here before those are applied.
     deferred = getattr(DEFERRED_RESTORE, 'kps_list', None)
-    if deferred and (modules.globals.face_rot_range != 0 or modules.globals.show_target_face_box
+    if deferred and (rotation != 0 or modules.globals.show_target_face_box
                      or modules.globals.use_pencil_filter or modules.globals.use_ink_filter_white
                      or modules.globals.use_ink_filter_black):
         temp_frame = restore_faces(temp_frame, deferred)
@@ -921,7 +931,7 @@ def process_frame(source_face: List[Face], temp_frame: Frame) -> Frame:
             temp_frame = draw_all_landmarks(temp_frame, face) # Draw the face landmarks
 
     # Rotate back the frame
-    temp_frame = _rotate_frame(temp_frame, -modules.globals.face_rot_range)
+    temp_frame = _rotate_frame(temp_frame, -rotation)
 
 
     # Apply filters based on settings

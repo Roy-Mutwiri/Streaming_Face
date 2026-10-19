@@ -14,6 +14,7 @@ import onnxruntime
 
 import modules.globals
 from modules.accel import get_providers
+from modules.face_masks import add_grain
 from modules.utilities import resolve_relative_path
 
 MODELS = {
@@ -74,8 +75,12 @@ def _get_paste_mask(size: int) -> np.ndarray:
 
 
 def restore_face(frame: np.ndarray, kps: np.ndarray, model_name: Optional[str] = None,
-                 blend: Optional[float] = None) -> np.ndarray:
-    """Restores the face described by the 5 keypoints `kps` inside `frame` and returns the new frame."""
+                 blend: Optional[float] = None, grain: float = 0.0) -> np.ndarray:
+    """
+    Restores the face described by the 5 keypoints `kps` inside `frame` and returns the new frame.
+    grain: camera noise sigma measured on the original face; GPEN's output is noise free, so the
+    same amount of grain is put back to keep the face from looking pasted onto a noisy frame.
+    """
     model_name = model_name or modules.globals.live_enhancer
     blend = modules.globals.enhancer_blend if blend is None else blend
     loaded = get_session(model_name)
@@ -108,12 +113,13 @@ def restore_face(frame: np.ndarray, kps: np.ndarray, model_name: Optional[str] =
     restored_back = cv2.warpAffine(restored, inverse, (rw, rh), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
     mask = cv2.warpAffine(_get_paste_mask(size), inverse, (rw, rh), flags=cv2.INTER_LINEAR, borderValue=0)
     # Edits the frame in place (callers own it) and returns it for convenience
-    frame[y1:y2, x1:x2] = cv2.blendLinear(restored_back, region, mask, 1.0 - mask)
+    blended = cv2.blendLinear(restored_back, region, mask, 1.0 - mask)
+    frame[y1:y2, x1:x2] = add_grain(blended, mask, grain) if modules.globals.grain_match else blended
     return frame
 
 
-def restore_faces(frame: np.ndarray, kps_list) -> np.ndarray:
-    """Restores every face (given by its 5 keypoints in frame coordinates) in an already swapped frame."""
-    for kps in kps_list:
-        frame = restore_face(frame, kps)
+def restore_faces(frame: np.ndarray, faces) -> np.ndarray:
+    """Restores every face, given as (5 keypoints in frame coordinates, grain sigma), in an already swapped frame."""
+    for kps, grain in faces:
+        frame = restore_face(frame, kps, grain=grain)
     return frame

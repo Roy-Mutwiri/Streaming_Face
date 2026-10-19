@@ -15,6 +15,8 @@ p.add_argument('--seconds', type=float, default=15)
 p.add_argument('--enhancer', default='GPEN-256', choices=['Off', 'GPEN-256', 'GPEN-512'])
 p.add_argument('--no-tensorrt', action='store_true')
 p.add_argument('--save', help='write one processed frame to this path')
+p.add_argument('--no-grain', action='store_true')
+p.add_argument('--mask', default=None, help='face mask mode override')
 args = p.parse_args()
 
 import modules.globals as g
@@ -26,6 +28,8 @@ g.face_index_range = -1
 g.live_enhancer = args.enhancer
 g.use_tensorrt = not args.no_tensorrt
 g.live_mode = True  # benchmark the Live settings
+g.grain_match = not args.no_grain
+if args.mask: g.face_mask_mode = args.mask
 
 from modules.face_analyser import initialize_face_analyser, get_many_faces
 from modules.processors.frame import face_swapper
@@ -66,15 +70,19 @@ print(f'Frame size: {frame.shape[1]}x{frame.shape[0]}  faces in first frame: {le
 for _ in range(10):
     ok, frame = read()
     out = face_swapper.process_frame(source_faces, frame)
-# Same two-stage pipeline as the Live preview (modules/ui.py): swap on one thread, GPEN on another
+# Same three-stage pipeline as the Live preview (modules/ui.py): detect, swap and GPEN on their own threads
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from modules.face_restore import restore_faces
 
-def swap_stage(frame):
+def detect_stage(frame):
+    return frame, face_swapper.detect_frame_faces(frame)
+
+def swap_stage(detect_future):
+    frame, detected = detect_future.result()
     face_swapper.begin_deferred_restore()
     try:
-        frame = face_swapper.process_frame(source_faces, frame)
+        frame = face_swapper.process_frame(source_faces, frame, detected)
     finally:
         kps_list = face_swapper.end_deferred_restore()
     return frame, kps_list
@@ -83,14 +91,14 @@ def restore_stage(swap_future):
     frame, kps_list = swap_future.result()
     return restore_faces(frame, kps_list) if g.live_enhancer != 'Off' else frame
 
-swap_worker, restore_worker, in_flight = ThreadPoolExecutor(1), ThreadPoolExecutor(1), deque()
+detect_worker, swap_worker, restore_worker, in_flight = ThreadPoolExecutor(1), ThreadPoolExecutor(1), ThreadPoolExecutor(1), deque()
 
 frames, t0, win_t, win_n = 0, time.time(), time.time(), 0
 while time.time() - t0 < args.seconds:
     ok, frame = read()
     if not ok:
         break
-    in_flight.append(restore_worker.submit(restore_stage, swap_worker.submit(swap_stage, frame)))
+    in_flight.append(restore_worker.submit(restore_stage, swap_worker.submit(swap_stage, detect_worker.submit(detect_stage, frame))))
     if len(in_flight) < 3:
         continue
     out = in_flight.popleft().result()

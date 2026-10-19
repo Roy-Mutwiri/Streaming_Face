@@ -1343,23 +1343,31 @@ def webcam_preview():
 
     averaged_source = prepare_source_faces(source_images, average=True)
 
-    def swap_stage(frame, check_rotation):
-        """Stage 1 (worker thread): detection + swap. Face restoration is deferred to stage 2."""
+    def detect_stage(frame, check_rotation):
+        """Stage 1 (worker thread): auto-rotation + face detection, one frame ahead of the swap."""
         new_rot = detect_rotation(frame) if check_rotation else None
         if new_rot is not None:
             modules.globals.face_rot_range = new_rot
+        return frame, face_swapper_module.detect_frame_faces(frame), new_rot
+
+    def swap_stage(detect_future):
+        """Stage 2 (worker thread): swap. Face restoration is deferred to stage 3."""
+        frame, detected, new_rot = detect_future.result()
         # 'Average source faces' can be toggled while Live runs
         faces = averaged_source if modules.globals.average_source_faces else source_images
         begin_deferred_restore()
         try:
             for frame_processor in frame_processors:
-                frame = frame_processor.process_frame(faces, frame)
+                if frame_processor is face_swapper_module:
+                    frame = frame_processor.process_frame(faces, frame, detected)
+                else:
+                    frame = frame_processor.process_frame(faces, frame)
         finally:
             kps_list = end_deferred_restore()
         return frame, kps_list, new_rot
 
     def restore_stage(swap_future):
-        """Stage 2 (second worker thread): GPEN restoration, overlapping the next frame's swap on the GPU."""
+        """Stage 3 (worker thread): GPEN restoration, overlapping the next frames' swap and detection."""
         frame, kps_list, new_rot = swap_future.result()
         if modules.globals.live_enhancer != 'Off' and kps_list:
             frame = restore_faces(frame, kps_list)
@@ -1373,6 +1381,7 @@ def webcam_preview():
     modules.globals.live_mode = True
     face_swapper_module.FACE_SMOOTHER.reset()
     grabber = CameraGrabber(lambda: camera)
+    detect_worker = ThreadPoolExecutor(max_workers=1)
     swap_worker = ThreadPoolExecutor(max_workers=1)
     restore_worker = ThreadPoolExecutor(max_workers=1)
     in_flight = deque()
@@ -1396,8 +1405,9 @@ def webcam_preview():
         check_rotation = modules.globals.auto_rotate_value and rotation_check_counter % modules.globals.rotation_check_interval == 0
         rotation_check_counter += 1
 
-        # Pipeline: swap frame N while restoring frame N-1 and displaying frame N-2
-        swap_future = swap_worker.submit(swap_stage, current_frame, check_rotation)
+        # Pipeline: detect frame N, swap frame N-1 and restore frame N-2 at the same time
+        detect_future = detect_worker.submit(detect_stage, current_frame, check_rotation)
+        swap_future = swap_worker.submit(swap_stage, detect_future)
         in_flight.append(restore_worker.submit(restore_stage, swap_future))
         if len(in_flight) < 3:
             continue
@@ -1453,6 +1463,7 @@ def webcam_preview():
             break
 
     grabber.stop()
+    detect_worker.shutdown(wait=True)
     swap_worker.shutdown(wait=True)
     restore_worker.shutdown(wait=True)
     modules.globals.live_mode = False

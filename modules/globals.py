@@ -116,6 +116,7 @@ live_mode = False            # set while the Live webcam preview runs
 # Image/video files are not real-time, so they get the slower, highest-quality settings
 file_swap_resolution = 256   # pixel boost for files (Live uses swap_resolution)
 file_enhancer = 'GPEN-512'   # restorer for files when live_enhancer is not 'Off'
+grain_match = True           # put the target's camera noise back on the (noise free) restored face
 average_source_faces = False # Average all faces in the source image into one identity (several photos of one person)
 
 mask_target_option = "Both" # Add this line

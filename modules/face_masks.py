@@ -112,6 +112,39 @@ def match_tone(swapped_face: np.ndarray, target_face: np.ndarray, mask: np.ndarr
     return cv2.cvtColor(np.clip(result, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 
+def estimate_noise(region: np.ndarray) -> float:
+    """
+    Camera noise level (sigma, 0-255 scale) of an image region, from the median absolute
+    high-pass response (robust to edges). Webcams are typically 2-5, clean video below 1.
+    """
+    h, w = region.shape[:2]
+    if h > 160 and w > 160:  # the centre of the face is plenty for a noise estimate
+        region = region[(h - 160) // 2:(h + 160) // 2, (w - 160) // 2:(w + 160) // 2]
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    high_pass = gray - cv2.GaussianBlur(gray, (3, 3), 0)
+    return float(np.median(np.abs(high_pass)) * 1.4826 * 1.25)  # 1.25: calibrated so known synthetic noise reads back 1:1
+
+
+NOISE_TILE: Optional[np.ndarray] = None
+RNG = np.random.default_rng()
+
+
+def add_grain(region: np.ndarray, mask: np.ndarray, sigma: float) -> np.ndarray:
+    """Adds luminance grain of the given sigma where mask is set, so a restored (clean) face
+    carries the same camera noise as the rest of the frame. Uses a random window of a
+    pre-generated noise texture each call (fresh grain every frame, no per-frame RNG cost)."""
+    global NOISE_TILE
+    if sigma < 0.5:
+        return region
+    h, w = region.shape[:2]
+    if NOISE_TILE is None or NOISE_TILE.shape[0] < h or NOISE_TILE.shape[1] < w:
+        size = max(1024, h, w)
+        NOISE_TILE = RNG.standard_normal((size * 2, size * 2), dtype=np.float32)
+    y, x = RNG.integers(0, NOISE_TILE.shape[0] - h), RNG.integers(0, NOISE_TILE.shape[1] - w)
+    grain = cv2.multiply(NOISE_TILE[y:y + h, x:x + w], mask, scale=sigma)
+    return cv2.add(region, cv2.merge([grain, grain, grain]), dtype=cv2.CV_8U)
+
+
 def build_mask(aligned_target: np.ndarray, box_mask: np.ndarray, mode: Optional[str] = None) -> np.ndarray:
     """Final blend mask in aligned-face space for the current mask mode."""
     mode = mode or modules.globals.face_mask_mode
