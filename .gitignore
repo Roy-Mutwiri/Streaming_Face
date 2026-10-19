@@ -1,0 +1,16 @@
+# Ignore the gfpgan directory and all its content
+gfpgan/
+
+# Ignore the specific model files
+models/GFPGANv1.4.pth
+models/inswapper_128_fp16.onnx
+
+# Ignore all __pycache__ directories anywhere within the repo
+**/__pycache__/
+
+# Ignore the venv directory (virtual environment)
+venv/
+
+# Downloaded models and TensorRT engine cache
+models/*.onnx
+models/trt_cache/
