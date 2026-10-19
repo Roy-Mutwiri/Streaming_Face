@@ -1315,6 +1315,8 @@ def webcam_preview():
     
         if not source_images:
             print('No face found in source image')
+            update_status('No face found in the source photo. Choose a clear, front-facing photo and press Live again.')
+            PREVIEW.withdraw()
             if enhancer_switch:
                 enhancer_switch.configure(state="normal")
                 if previous_enhancer_state:
@@ -1494,9 +1496,12 @@ def webcam_preview():
             # Reuse one Tk photo image and paste new pixels into it. Creating a CTkImage per frame
             # re-resizes the whole picture in PIL and allocates a new Tk image, which capped the FPS.
             if live_photo is None or (live_photo.width(), live_photo.height()) != (current_width, current_height):
-                live_photo = ImageTk.PhotoImage(image)
+                # Attach the new image before the old one is released, otherwise the label's next
+                # redraw (the resize below) refers to a deleted image and Tk raises TclError
+                new_photo = ImageTk.PhotoImage(image)
+                preview_label_cam._label.configure(image=new_photo)
+                live_photo = new_photo
                 preview_label_cam.configure(width=current_width, height=current_height)
-                preview_label_cam._label.configure(image=live_photo)
             else:
                 live_photo.paste(image)
             ROOT.update()

@@ -41,6 +41,7 @@ def get_face_enhancer() -> Any:
 
     with THREAD_LOCK:
         if FACE_ENHANCER is None:
+            pre_check()  # switching the enhancer on in the UI does not run pre_check, so make sure the model exists
             if os.name == 'nt':
                 model_path = resolve_relative_path('..\models\GFPGANv1.4.pth')
                 

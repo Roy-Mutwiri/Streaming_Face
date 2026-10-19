@@ -5,13 +5,8 @@
 #   py -3.11 -m venv venv
 #   venv\Scripts\python -m pip install -r requirements.txt
 #
-# After installing, patch basicsr for the newer torchvision (one line):
-#   venv\Lib\site-packages\basicsr\data\degradations.py:
-#     from torchvision.transforms.functional_tensor import rgb_to_grayscale
-#   ->from torchvision.transforms.functional import rgb_to_grayscale
-#
 # Models: inswapper_128.onnx (fp32 -- do not use inswapper_128_fp16.onnx, it is broken), gpen_bfr_256/512,
-# xseg_1 and bisenet_resnet_34 are downloaded into models/ on first run. TensorRT engines are built
+# xseg_1, bisenet_resnet_34 and rvm_mobilenetv3_fp32 are downloaded into models/ on first run. TensorRT engines are built
 # once into models/trt_cache (first launch takes several minutes).
 
 --extra-index-url https://download.pytorch.org/whl/cu128
