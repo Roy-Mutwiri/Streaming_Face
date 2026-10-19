@@ -29,6 +29,7 @@ Based on [iRoopDeepFaceCam](https://github.com/iVideoGameBoss/iRoopDeepFaceCam) 
 13. [Troubleshooting](#13-troubleshooting)
 14. [Project structure](#14-project-structure)
 15. [Credits, licenses and responsible use](#15-credits-licenses-and-responsible-use)
+16. [Auto-sync to GitHub (for contributors)](#16-auto-sync-to-github-for-contributors)
 
 ---
 
@@ -405,3 +406,25 @@ README_ORIGINAL.md           the original iRoopDeepFaceCam documentation
 **Use this responsibly.** Only use a person's face with their consent. Do not use it to deceive,
 impersonate, harass or defraud anyone, and label altered content as such where required. You are
 responsible for complying with the laws that apply to you.
+
+---
+
+## 16. Auto-sync to GitHub (for contributors)
+
+`tools/auto_push.py` keeps this repository in sync automatically: it watches the project folder and,
+once changes have been quiet for **2 minutes** (so a half-finished edit is not pushed), commits
+them with a message listing the changed files and pushes to `main`.
+
+| Task | How |
+|---|---|
+| Install (starts at every logon, no window) | double-click `tools\install_auto_push.bat` |
+| Start by hand | `pythonw toolsuto_push.py` |
+| See what it did | `toolsuto_push.log` |
+| Pause / resume | create / delete a file named `.autopush-pause` in the project folder |
+| Stop | `py -3.11 toolsuto_push.py --stop` |
+| Uninstall | delete *StreamingFace AutoPush* from the Startup folder (`Win+R`, `shell:startup`) |
+
+It never commits files larger than 50 MB (models and the `venv` are excluded by `.gitignore`
+anyway), waits while another git command is running, and retries pushes when you are offline.
+Commits made by hand are pushed too. For your commits to appear on your GitHub profile, the
+repository's `git config user.email` must be an email verified on your GitHub account.

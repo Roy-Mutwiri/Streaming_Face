@@ -1,6 +1,8 @@
 @echo off
-rem Starts tools\auto_push.py at every Windows logon (no window) and starts it now.
-rem Remove again with:  schtasks /Delete /TN "StreamingFace AutoPush" /F
+rem Starts tools\auto_push.py at every Windows logon (Startup-folder shortcut, no admin rights
+rem needed, no window) and starts it now.
+rem Remove: delete "StreamingFace AutoPush" from the Startup folder (Win+R, shell:startup)
+rem         and run:  py -3.11 tools\auto_push.py --stop
 cd /d "%~dp0.."
 
 set PYW=
@@ -11,7 +13,9 @@ if "%PYW%"=="" (
     exit /b 1
 )
 
-schtasks /Create /F /TN "StreamingFace AutoPush" /SC ONLOGON /RL LIMITED /TR "\"%PYW%\" \"%CD%\tools\auto_push.py\"" || goto :error
+powershell -NoProfile -Command ^
+  "$s = (New-Object -ComObject WScript.Shell).CreateShortcut([IO.Path]::Combine([Environment]::GetFolderPath('Startup'), 'StreamingFace AutoPush.lnk'));" ^
+  "$s.TargetPath = '%PYW%'; $s.Arguments = '\"%CD%\tools\auto_push.py\"'; $s.WorkingDirectory = '%CD%'; $s.WindowStyle = 7; $s.Save()" || goto :error
 start "" "%PYW%" "%CD%\tools\auto_push.py"
 echo.
 echo Auto-push is installed and running. Changes are pushed to GitHub 2 minutes after you stop editing.
@@ -20,6 +24,6 @@ pause
 exit /b 0
 
 :error
-echo Could not create the scheduled task.
+echo Could not create the Startup shortcut.
 pause
 exit /b 1
