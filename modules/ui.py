@@ -980,16 +980,38 @@ def create_preview(parent: ctk.CTkToplevel) -> ctk.CTkToplevel:
     ctk.CTkSwitch(realism_frame, text='Anti-jitter', variable=smooth_var, cursor='hand2',
                   command=lambda: setattr(modules.globals, 'temporal_smoothing', smooth_var.get())).pack(side='left', padx=10, pady=5)
 
+    # --- Third toolbar row: virtual background ---
+    background_frame = ctk.CTkFrame(preview)
+    background_frame.pack(fill='x', padx=10, pady=(0, 5))
+    ctk.CTkLabel(background_frame, text="Background ", font=("Arial", 16)).pack(side='left', padx=5, pady=5)
+    from modules.background import background_options, BACKGROUND_DIR
+    background_var = ctk.StringVar(value=modules.globals.live_background)
+    def select_background(value):
+        modules.globals.live_background = value
+        if value != 'None':
+            # Load the matting model and build the scene now, so the live stream does not stall on the first frame
+            import modules.background as background_module
+            threading.Thread(target=background_module.preload, args=(value,), daemon=True).start()
+    background_menu = ctk.CTkOptionMenu(background_frame, values=background_options(), variable=background_var, width=200,
+                                        command=select_background)
+    background_menu.pack(side='left', padx=5, pady=5)
+    # Re-scan backgrounds/ when the menu is opened again via this button
+    ctk.CTkButton(background_frame, text='Refresh', width=70,
+                  command=lambda: background_menu.configure(values=background_options())).pack(side='left', padx=5, pady=5)
+    ctk.CTkButton(background_frame, text='Open backgrounds folder', width=170,
+                  command=lambda: (os.makedirs(BACKGROUND_DIR, exist_ok=True), os.startfile(BACKGROUND_DIR))).pack(side='left', padx=5, pady=5)
+
     preview_label_cam = ctk.CTkLabel(preview, text=None)
     preview_label_cam.pack(fill='y', expand=True)
 
     # Double-click event handling
     is_switch_frame_visible = True
     realism_height = realism_frame.winfo_reqheight()
+    background_height = background_frame.winfo_reqheight()
 
     def on_double_click(event):
         nonlocal is_switch_frame_visible
-        for frame, height in ((switch_frame, original_height), (realism_frame, realism_height)):
+        for frame, height in ((switch_frame, original_height), (realism_frame, realism_height), (background_frame, background_height)):
             if is_switch_frame_visible:
                 # Hide the toolbar by setting its height to 0
                 frame.pack_propagate(False)  # Allow manual height adjustment
@@ -1320,6 +1342,7 @@ def webcam_preview():
 
     from modules.processors.frame.face_swapper import estimate_head_rotation, begin_deferred_restore, end_deferred_restore
     import modules.processors.frame.face_swapper as face_swapper_module
+    import modules.background as background_module
     from modules.face_restore import restore_faces
 
     def detect_rotation(frame):
@@ -1348,11 +1371,15 @@ def webcam_preview():
         new_rot = detect_rotation(frame) if check_rotation else None
         if new_rot is not None:
             modules.globals.face_rot_range = new_rot
-        return frame, face_swapper_module.detect_frame_faces(frame), new_rot
+        # Person matte for the virtual background, from the camera frame before the swap,
+        # computed in parallel with face detection
+        matte = background_module.MATTE_POOL.submit(background_module.MATTER, frame) if modules.globals.live_background != 'None' else None
+        detected = face_swapper_module.detect_frame_faces(frame)
+        return frame, detected, new_rot, matte.result() if matte else None
 
     def swap_stage(detect_future):
         """Stage 2 (worker thread): swap. Face restoration is deferred to stage 3."""
-        frame, detected, new_rot = detect_future.result()
+        frame, detected, new_rot, alpha = detect_future.result()
         # 'Average source faces' can be toggled while Live runs
         faces = averaged_source if modules.globals.average_source_faces else source_images
         begin_deferred_restore()
@@ -1364,13 +1391,20 @@ def webcam_preview():
                     frame = frame_processor.process_frame(faces, frame)
         finally:
             kps_list = end_deferred_restore()
-        return frame, kps_list, new_rot
+        return frame, kps_list, new_rot, alpha
 
     def restore_stage(swap_future):
-        """Stage 3 (worker thread): GPEN restoration, overlapping the next frames' swap and detection."""
-        frame, kps_list, new_rot = swap_future.result()
+        """Stage 3 (worker thread): GPEN restoration, overlapping the next frames."""
+        frame, kps_list, new_rot, alpha = swap_future.result()
         if modules.globals.live_enhancer != 'Off' and kps_list:
             frame = restore_faces(frame, kps_list)
+        return frame, new_rot, alpha
+
+    def background_stage(restore_future):
+        """Stage 4 (worker thread): virtual background composite."""
+        frame, new_rot, alpha = restore_future.result()
+        if alpha is not None:
+            frame = background_module.compose(frame, alpha)
         return frame, new_rot
 
     frame_count = 0
@@ -1380,10 +1414,12 @@ def webcam_preview():
 
     modules.globals.live_mode = True
     face_swapper_module.FACE_SMOOTHER.reset()
+    background_module.MATTER.reset()
     grabber = CameraGrabber(lambda: camera)
     detect_worker = ThreadPoolExecutor(max_workers=1)
     swap_worker = ThreadPoolExecutor(max_workers=1)
     restore_worker = ThreadPoolExecutor(max_workers=1)
+    background_worker = ThreadPoolExecutor(max_workers=1)
     in_flight = deque()
     last_frame_id = -1
     live_photo = None
@@ -1405,11 +1441,12 @@ def webcam_preview():
         check_rotation = modules.globals.auto_rotate_value and rotation_check_counter % modules.globals.rotation_check_interval == 0
         rotation_check_counter += 1
 
-        # Pipeline: detect frame N, swap frame N-1 and restore frame N-2 at the same time
+        # Pipeline: detect frame N, swap N-1, restore N-2 and composite the background of N-3 at once
         detect_future = detect_worker.submit(detect_stage, current_frame, check_rotation)
         swap_future = swap_worker.submit(swap_stage, detect_future)
-        in_flight.append(restore_worker.submit(restore_stage, swap_future))
-        if len(in_flight) < 3:
+        restore_future = restore_worker.submit(restore_stage, swap_future)
+        in_flight.append(background_worker.submit(background_stage, restore_future))
+        if len(in_flight) < 4:
             continue
         processed_frame, new_rot = in_flight.popleft().result()
 
@@ -1466,6 +1503,7 @@ def webcam_preview():
     detect_worker.shutdown(wait=True)
     swap_worker.shutdown(wait=True)
     restore_worker.shutdown(wait=True)
+    background_worker.shutdown(wait=True)
     modules.globals.live_mode = False
     with CAMERA_LOCK:
         camera.release()

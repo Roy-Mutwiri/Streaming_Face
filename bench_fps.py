@@ -16,6 +16,7 @@ p.add_argument('--enhancer', default='GPEN-256', choices=['Off', 'GPEN-256', 'GP
 p.add_argument('--no-tensorrt', action='store_true')
 p.add_argument('--save', help='write one processed frame to this path')
 p.add_argument('--no-grain', action='store_true')
+p.add_argument('--background', default='None')
 p.add_argument('--mask', default=None, help='face mask mode override')
 args = p.parse_args()
 
@@ -30,6 +31,7 @@ g.use_tensorrt = not args.no_tensorrt
 g.live_mode = True  # benchmark the Live settings
 g.grain_match = not args.no_grain
 if args.mask: g.face_mask_mode = args.mask
+g.live_background = args.background
 
 from modules.face_analyser import initialize_face_analyser, get_many_faces
 from modules.processors.frame import face_swapper
@@ -75,31 +77,42 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from modules.face_restore import restore_faces
 
+import modules.background as background
+
 def detect_stage(frame):
-    return frame, face_swapper.detect_frame_faces(frame)
+    matte = background.MATTE_POOL.submit(background.MATTER, frame) if g.live_background != 'None' else None
+    detected = face_swapper.detect_frame_faces(frame)
+    return frame, detected, matte.result() if matte else None
 
 def swap_stage(detect_future):
-    frame, detected = detect_future.result()
+    frame, detected, alpha = detect_future.result()
     face_swapper.begin_deferred_restore()
     try:
         frame = face_swapper.process_frame(source_faces, frame, detected)
     finally:
         kps_list = face_swapper.end_deferred_restore()
-    return frame, kps_list
+    return frame, kps_list, alpha
 
 def restore_stage(swap_future):
-    frame, kps_list = swap_future.result()
-    return restore_faces(frame, kps_list) if g.live_enhancer != 'Off' else frame
+    frame, kps_list, alpha = swap_future.result()
+    frame = restore_faces(frame, kps_list) if g.live_enhancer != 'Off' else frame
+    return frame, alpha
 
-detect_worker, swap_worker, restore_worker, in_flight = ThreadPoolExecutor(1), ThreadPoolExecutor(1), ThreadPoolExecutor(1), deque()
+def background_stage(restore_future):
+    frame, alpha = restore_future.result()
+    return background.compose(frame, alpha) if alpha is not None else frame
+
+detect_worker, swap_worker, restore_worker, background_worker, in_flight = ThreadPoolExecutor(1), ThreadPoolExecutor(1), ThreadPoolExecutor(1), ThreadPoolExecutor(1), deque()
+if g.live_background != 'None':
+    background.preload(g.live_background)
 
 frames, t0, win_t, win_n = 0, time.time(), time.time(), 0
 while time.time() - t0 < args.seconds:
     ok, frame = read()
     if not ok:
         break
-    in_flight.append(restore_worker.submit(restore_stage, swap_worker.submit(swap_stage, detect_worker.submit(detect_stage, frame))))
-    if len(in_flight) < 3:
+    in_flight.append(background_worker.submit(background_stage, restore_worker.submit(restore_stage, swap_worker.submit(swap_stage, detect_worker.submit(detect_stage, frame)))))
+    if len(in_flight) < 4:
         continue
     out = in_flight.popleft().result()
     frames += 1; win_n += 1

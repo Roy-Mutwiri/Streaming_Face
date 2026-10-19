@@ -14,3 +14,7 @@ venv/
 # Downloaded models and TensorRT engine cache
 models/*.onnx
 models/trt_cache/
+
+# Your own virtual backgrounds (only the README is tracked)
+backgrounds/*
+!backgrounds/README.txt
