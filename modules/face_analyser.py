@@ -1,5 +1,6 @@
 from typing import Any, List, Optional
 import insightface
+import numpy as np
 
 import modules.globals
 from modules.typing import Frame,Face
@@ -72,3 +73,18 @@ def get_one_face_right(frame: Frame) -> Optional[Face]:
 def get_two_faces(frame: Frame) -> List[Face]:
     faces = FACE_ANALYSER.get(frame, max_num=2)
     return sorted(faces, key=lambda x: x.bbox[0])
+
+def prepare_source_faces(faces: List[Face], average: Optional[bool] = None) -> List[Face]:
+    """
+    With 'average source faces' on, all faces in the source image are treated as photos of the
+    same person and merged into one identity (mean of their normalised embeddings). Several
+    angles/lighting conditions give a steadier, more accurate likeness than a single photo.
+    """
+    average = modules.globals.average_source_faces if average is None else average
+    if not average or len(faces) < 2:
+        return faces
+    embedding = np.mean([face.normed_embedding for face in faces], axis=0)
+    norm = np.linalg.norm(embedding)
+    merged = Face(dict(max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))))
+    merged.embedding = embedding / norm * np.linalg.norm(merged.embedding)
+    return [merged]

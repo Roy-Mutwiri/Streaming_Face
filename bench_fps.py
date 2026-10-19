@@ -25,6 +25,7 @@ g.both_faces = False
 g.face_index_range = -1
 g.live_enhancer = args.enhancer
 g.use_tensorrt = not args.no_tensorrt
+g.live_mode = True  # benchmark the Live settings
 
 from modules.face_analyser import initialize_face_analyser, get_many_faces
 from modules.processors.frame import face_swapper

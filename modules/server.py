@@ -11,7 +11,7 @@ from waitress import serve
 import modules.globals
 # Import both processors
 from modules.processors.frame import face_swapper, face_enhancer
-from modules.face_analyser import get_many_faces
+from modules.face_analyser import get_many_faces, prepare_source_faces
 
 app = Flask(__name__)
 CORS(app)
@@ -75,7 +75,7 @@ def swap_image():
     try:
         source_image = cv2.imread(modules.globals.source_path)
         faces = get_many_faces(source_image)
-        source_images = sorted(faces, key=lambda face: face.bbox[0])[:20]
+        source_images = prepare_source_faces(sorted(faces, key=lambda face: face.bbox[0])[:20])
         
         if not source_images:
             return jsonify({"error": "No faces in source"}), 400

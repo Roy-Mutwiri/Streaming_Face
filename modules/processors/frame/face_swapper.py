@@ -1,4 +1,4 @@
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import cv2  # This is a library for working with images and videos
 import insightface  # This is a library for detecting and analyzing faces
 import threading  # This helps run parts of the program at the same time
@@ -9,9 +9,12 @@ import modules.globals # This lets us use settings that apply to the whole progr
 import modules.processors.frame.core # This is for processing video frames
 
 # These are functions from other parts of the program that help us find faces
-from modules.face_analyser import get_one_face, get_many_faces, get_one_face_left, get_one_face_right, get_face_analyser, get_many_faces_fast
+from modules.face_analyser import get_one_face, get_many_faces, get_one_face_left, get_one_face_right, get_face_analyser, get_many_faces_fast, prepare_source_faces
 from modules.accel import get_providers
 from modules.face_restore import restore_face, restore_faces
+from modules.face_masks import build_mask, match_tone
+from concurrent.futures import ThreadPoolExecutor
+from modules.temporal import FaceSmoother
 from insightface.utils import face_align
 from insightface.model_zoo.inswapper import INSwapper
 from modules.trt_engine import create_session as create_trt_session
@@ -135,8 +138,6 @@ def get_face_swapper() -> Any:
                 FACE_SWAPPER = insightface.model_zoo.get_model(model_path, providers=providers)
     return FACE_SWAPPER
 
-# Feathered mask in the swapper's aligned 128x128 space (built once)
-SWAP_MASK: Optional[np.ndarray] = None
 
 # Live mode runs face restoration on a second thread (pipelined with the next frame's swap).
 # While deferred, swaps only record the face keypoints instead of restoring inline.
@@ -150,57 +151,103 @@ def end_deferred_restore() -> List[np.ndarray]:
     DEFERRED_RESTORE.kps_list = None
     return kps_list
 
+SWAP_MASKS: Dict[int, np.ndarray] = {}
+# Segmentation masks run on this thread while the swap model runs on the GPU
+MASK_POOL = ThreadPoolExecutor(max_workers=1)
+# Landmark smoothing across live frames (reset when Live starts)
+FACE_SMOOTHER = FaceSmoother()
+
 def _get_swap_mask(size: int) -> np.ndarray:
-    global SWAP_MASK
-    if SWAP_MASK is None or SWAP_MASK.shape[0] != size:
+    """Feathered box mask in the swapper's aligned space (built once per size)."""
+    if size not in SWAP_MASKS:
         mask = np.zeros((size, size), dtype=np.float32)
         pad = int(size * 0.1)
         mask[pad:size - pad, pad:size - pad] = 1.0
-        SWAP_MASK = cv2.GaussianBlur(mask, (0, 0), size * 0.05)
-    return SWAP_MASK
+        SWAP_MASKS[size] = cv2.GaussianBlur(mask, (0, 0), size * 0.05)
+    return SWAP_MASKS[size]
+
+def _run_swapper(face_swapper: Any, aligned: np.ndarray, latent: np.ndarray) -> np.ndarray:
+    """One pass of the 128px swapper on an aligned BGR face, returns the swapped BGR face."""
+    blob = cv2.dnn.blobFromImage(aligned, 1.0 / face_swapper.input_std, face_swapper.input_size,
+                                 (face_swapper.input_mean,) * 3, swapRB=True)
+    prediction = face_swapper.session.run(face_swapper.output_names,
+                                          {face_swapper.input_names[0]: blob, face_swapper.input_names[1]: latent})[0]
+    return np.clip(255 * prediction[0].transpose(1, 2, 0), 0, 255).astype(np.uint8)[:, :, ::-1]
+
+def _pixel_boost_swap(face_swapper: Any, aligned: np.ndarray, latent: np.ndarray, factor: int) -> np.ndarray:
+    """
+    Swaps at factor x the model resolution: the aligned face is split into factor^2 interleaved
+    128px sub-images (every factor-th pixel), each is swapped, and the results are re-interleaved.
+    Gives a genuinely higher-resolution swap from the 128px model (as in FaceFusion's pixel boost).
+    """
+    size = face_swapper.input_size[0]
+    tiles = aligned.reshape(size, factor, size, factor, 3).transpose(1, 3, 0, 2, 4).reshape(factor * factor, size, size, 3)
+    swapped = np.stack([_run_swapper(face_swapper, np.ascontiguousarray(tile), latent) for tile in tiles])
+    return swapped.reshape(factor, factor, size, size, 3).transpose(2, 0, 3, 1, 4).reshape(size * factor, size * factor, 3)
 
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     """
     Swaps the source face onto the target face in the given frame.
 
-    The 128px swap result is upscaled with bicubic interpolation (sharper than insightface's
-    bilinear paste), lightly sharpened, optionally restored with GPEN, and blended once
-    through a feathered mask limited to the face outline.
+    Steps, all in the swapper's aligned face space until the final paste:
+      1. align the target face (128px, or 256/512 with pixel boost)
+      2. start the segmentation mask (occlusion / face parser) on a helper thread
+      3. run the swapper (once, or factor^2 times with pixel boost)
+      4. match the swapped face's skin tone to the target
+      5. warp back with bicubic interpolation, light unsharp mask, blend through the mask
     """
     face_swapper = get_face_swapper() # Gets the face swapper model
-    size = face_swapper.input_size[0]
+    model_size = face_swapper.input_size[0]
+    resolution = modules.globals.swap_resolution if modules.globals.live_mode else max(modules.globals.swap_resolution, modules.globals.file_swap_resolution)
+    swap_size = max(model_size, int(resolution))
+    factor = swap_size // model_size
+    swap_size = model_size * factor
 
-    # Align the target face to the swapper's 128x128 template and run the model
     # Same alignment as insightface's norm_crop2, but faces near the frame edge get replicated
     # border pixels instead of black, which the model would otherwise try to blend into the face
-    matrix = face_align.estimate_norm(target_face.kps, size, 'arcface')
-    aligned = cv2.warpAffine(temp_frame, matrix, (size, size), borderMode=cv2.BORDER_REPLICATE)
-    blob = cv2.dnn.blobFromImage(aligned, 1.0 / face_swapper.input_std, face_swapper.input_size,
-                                 (face_swapper.input_mean,) * 3, swapRB=True)
+    matrix = face_align.estimate_norm(target_face.kps, swap_size, 'arcface')
+    aligned = cv2.warpAffine(temp_frame, matrix, (swap_size, swap_size), borderMode=cv2.BORDER_REPLICATE)
+
+    mask_mode = modules.globals.face_mask_mode
+    segmentation = None
+    if mask_mode != 'Landmarks':
+        aligned_256 = aligned if swap_size == 256 else cv2.warpAffine(
+            temp_frame, face_align.estimate_norm(target_face.kps, 256, 'arcface'), (256, 256), borderMode=cv2.BORDER_REPLICATE)
+        segmentation = MASK_POOL.submit(build_mask, aligned_256, 1.0, mask_mode)
+
     latent = np.dot(source_face.normed_embedding.reshape((1, -1)), face_swapper.emap)
     latent /= np.linalg.norm(latent)
-    prediction = face_swapper.session.run(face_swapper.output_names,
-                                          {face_swapper.input_names[0]: blob, face_swapper.input_names[1]: latent})[0]
-    swapped_face = np.clip(255 * prediction[0].transpose(1, 2, 0), 0, 255).astype(np.uint8)[:, :, ::-1]
+    if factor == 1:
+        swapped_face = _run_swapper(face_swapper, aligned, latent)
+    else:
+        swapped_face = _pixel_boost_swap(face_swapper, aligned, latent, factor)
 
-    # Warp the swapped face back into the frame
+    aligned_mask = _get_swap_mask(swap_size)
+    if segmentation is not None:
+        aligned_mask = aligned_mask * cv2.resize(segmentation.result(), (swap_size, swap_size))
+
+    # Skin tone: shift the swapped face toward the target's colouring (neck, ears, lighting)
+    swapped_face = match_tone(swapped_face, aligned, aligned_mask, modules.globals.tone_match)
+
+    # Warp the swapped face and its mask back into the frame
     h, w = temp_frame.shape[:2]
     inverse = cv2.invertAffineTransform(matrix)
     swapped_frame = cv2.warpAffine(swapped_face, inverse, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-    swap_mask = cv2.warpAffine(_get_swap_mask(size), inverse, (w, h), flags=cv2.INTER_LINEAR, borderValue=0)
+    mask = cv2.warpAffine(aligned_mask, inverse, (w, h), flags=cv2.INTER_LINEAR, borderValue=0)
 
-    # Unsharp mask, scaled to how much the 128px face was enlarged
+    # Unsharp mask, scaled to how much the swapped face was enlarged
     if modules.globals.swap_sharpen > 0:
         upscale = 1.0 / math.sqrt(abs(np.linalg.det(matrix[:, :2])))
-        blurred = cv2.GaussianBlur(swapped_frame, (0, 0), max(1.0, upscale * 0.6))
-        swapped_frame = cv2.addWeighted(swapped_frame, 1 + modules.globals.swap_sharpen, blurred, -modules.globals.swap_sharpen, 0)
+        if upscale > 1:
+            blurred = cv2.GaussianBlur(swapped_frame, (0, 0), max(1.0, upscale * 0.6))
+            swapped_frame = cv2.addWeighted(swapped_frame, 1 + modules.globals.swap_sharpen, blurred, -modules.globals.swap_sharpen, 0)
 
-    # Limit the swap to the face outline (jaw + forehead) with a feather proportional to face size
-    face_mask = create_face_mask(target_face, temp_frame).astype(np.float32) / 255.0
-    face_width = target_face.bbox[2] - target_face.bbox[0]
-    feather = max(3, int(face_width * 0.06)) | 1
-    face_mask = cv2.GaussianBlur(face_mask, (feather, feather), 0)
-    mask = face_mask * swap_mask
+    if mask_mode == 'Landmarks':
+        # Limit the swap to the landmark outline (jaw + forehead) with a feather proportional to face size
+        face_mask = create_face_mask(target_face, temp_frame).astype(np.float32) / 255.0
+        face_width = target_face.bbox[2] - target_face.bbox[0]
+        feather = max(3, int(face_width * 0.06)) | 1
+        mask = mask * cv2.GaussianBlur(face_mask, (feather, feather), 0)
 
     return cv2.blendLinear(swapped_frame, temp_frame, mask, 1.0 - mask)
 
@@ -238,7 +285,11 @@ def _detect_faces(frame: Frame) -> List[Face]:
     """Detects faces in the given frame, returns an empty list if detection fails."""
     try:
         # Embeddings are only needed to tell faces apart when tracking
-        return get_many_faces_fast(frame, with_embedding=bool(modules.globals.face_tracking))
+        faces = get_many_faces_fast(frame, with_embedding=bool(modules.globals.face_tracking))
+        # Live video: smooth landmark jitter so the swapped face does not shimmer
+        if modules.globals.live_mode and modules.globals.temporal_smoothing:
+            faces = FACE_SMOOTHER(faces)
+        return faces
     except Exception as e:
         print(f"Error detecting faces: {e}") # If there's a problem, prints an error message
         return [] # If there's an error, returns an empty list
@@ -341,7 +392,7 @@ def _process_face_swap(frame: Frame, source_face: List[Face], target_face: Face,
         if deferred is not None:
             deferred.append(np.asarray(target_face.kps, dtype=np.float32)) # Restored later on the live restore thread
         else:
-            frame = restore_face(frame, target_face.kps)
+            frame = restore_face(frame, target_face.kps, model_name=modules.globals.file_enhancer) # Files: highest quality restorer
     return frame
 
 def _apply_mouth_masks(frame: Frame, target_faces: List[Face], mouth_masks: List[Tuple[np.ndarray, np.ndarray, tuple, tuple]], face_masks: List[np.ndarray]) -> Frame:
@@ -930,7 +981,7 @@ def process_frames(source_path: str, temp_frame_paths: List[str], progress: Any 
         source_image = cv2.imread(source_path) # Load the source image
         faces = get_many_faces(source_image) # Detect the faces in the source image
         if faces: # If there are any faces
-            source_face = sorted(faces, key=lambda face: face.bbox[0])[:10] # Sort the faces from left to right and take the first 10
+            source_face = prepare_source_faces(sorted(faces, key=lambda face: face.bbox[0])[:10]) # Sort the faces from left to right and take the first 10
 
     for temp_frame_path in temp_frame_paths: # Loop through all the frames
         temp_frame = cv2.imread(temp_frame_path) # Load the current frame
@@ -956,7 +1007,7 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
         source_image = cv2.imread(source_path) # Load the source image
         faces = get_many_faces(source_image) # Detect the faces in the source image
         if faces: # If there are any faces
-            source_face = sorted(faces, key=lambda face: face.bbox[0])[:10] # Sort the faces from left to right and take the first 10
+            source_face = prepare_source_faces(sorted(faces, key=lambda face: face.bbox[0])[:10]) # Sort the faces from left to right and take the first 10
     target_frame = cv2.imread(target_path) # Load the target image
 
     if modules.globals.flip_x: # If we should flip the frame horizontally

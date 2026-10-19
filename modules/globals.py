@@ -107,4 +107,15 @@ live_enhancer = 'GPEN-256'   # Face restoration after swap: 'Off', 'GPEN-256' or
 enhancer_blend = 0.8         # 0..1, how much of the restored face is blended over the raw swap
 swap_sharpen = 0.3           # 0..1, unsharp-mask amount applied to the upscaled 128px swap output
 
+# --- Realism ---
+face_mask_mode = 'Occlusion' # 'Landmarks', 'Occlusion' (hands/hair/objects stay in front), 'Parser', 'Occlusion+Parser'
+tone_match = 0.5             # 0..1, how far the swapped face's skin tone moves toward the target's
+swap_resolution = 128        # 128, 256 or 512: pixel boost (256 = 4 swapper passes, 512 = 16)
+temporal_smoothing = True    # Live: smooth landmark jitter between frames (One-Euro filter)
+live_mode = False            # set while the Live webcam preview runs
+# Image/video files are not real-time, so they get the slower, highest-quality settings
+file_swap_resolution = 256   # pixel boost for files (Live uses swap_resolution)
+file_enhancer = 'GPEN-512'   # restorer for files when live_enhancer is not 'Off'
+average_source_faces = False # Average all faces in the source image into one identity (several photos of one person)
+
 mask_target_option = "Both" # Add this line

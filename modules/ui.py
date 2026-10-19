@@ -8,7 +8,7 @@ from PIL import Image, ImageOps, ImageTk
 from cv2_enumerate_cameras import enumerate_cameras
 import modules.globals
 import modules.metadata
-from modules.face_analyser import get_one_face, get_one_face_left, get_one_face_right,get_many_faces,get_many_faces_fast
+from modules.face_analyser import get_one_face, get_one_face_left, get_one_face_right,get_many_faces,get_many_faces_fast, prepare_source_faces
 from modules.capturer import get_video_frame, get_video_frame_total
 from modules.processors.frame.core import get_frame_processors_modules
 
@@ -82,8 +82,8 @@ PREVIEW = None
 PREVIEW_IMAGE = None
 PREVIEW_MAX_HEIGHT = 700
 PREVIEW_MAX_WIDTH  = 1300
-PREVIEW_DEFAULT_WIDTH  = 640
-PREVIEW_DEFAULT_HEIGHT = 360
+PREVIEW_DEFAULT_WIDTH  = 1280  # 720p: more pixels on the face for the swap and restorer
+PREVIEW_DEFAULT_HEIGHT = 720
 BLUR_SIZE=1
 
 RECENT_DIRECTORY_SOURCE = None
@@ -646,7 +646,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     live_button = ctk.CTkButton(ui_container, text='Live', cursor='hand2', command=lambda: webcam_preview(), fg_color="green", hover_color="dark green")
     live_button.place(relx=space_between*4 + button_width*3, rely=button_y, relwidth=button_width, relheight=button_height)
 
-    preview_size_var = ctk.StringVar(value="640x360")
+    preview_size_var = ctk.StringVar(value="1280x720")
     preview_size_dropdown = ctk.CTkOptionMenu(ui_container, values=["426x240","480x270","512x288","640x360","854x480", "960x540", "1280x720", "1920x1080"],
                                               variable=preview_size_var,
                                               command=update_preview_size,
@@ -935,13 +935,6 @@ def create_preview(parent: ctk.CTkToplevel) -> ctk.CTkToplevel:
     # Store the switch in modules.globals for access from create_preview
     modules.globals.face2_index_dropdown_preview = face2_index_dropdown_preview 
 
-
-    preview_label_cam = ctk.CTkLabel(preview, text=None)
-    preview_label_cam.pack(fill='y', expand=True)
-
-    # Double-click event handling
-    is_switch_frame_visible = True
-
     def update_forehead_index(size):
         new_float_value = float(size)
         modules.globals.face_forehead_var = new_float_value
@@ -956,24 +949,55 @@ def create_preview(parent: ctk.CTkToplevel) -> ctk.CTkToplevel:
                                                     command=update_forehead_index,width=10)
     face_forehead_index_dropdown_preview.pack(side='left', padx=5, pady=5)
 
+    # --- Second toolbar row: realism controls ---
+    realism_frame = ctk.CTkFrame(preview)
+    realism_frame.pack(fill='x', padx=10, pady=(0, 5))
 
+    ctk.CTkLabel(realism_frame, text="Mask ", font=("Arial", 16)).pack(side='left', padx=5, pady=5)
+    mask_mode_var = ctk.StringVar(value=modules.globals.face_mask_mode)
+    ctk.CTkOptionMenu(realism_frame, values=['Landmarks', 'Occlusion', 'Parser', 'Occlusion+Parser'], variable=mask_mode_var, width=140,
+                      command=lambda value: setattr(modules.globals, 'face_mask_mode', value)).pack(side='left', padx=5, pady=5)
+
+    tone_label = ctk.CTkLabel(realism_frame, text=f" | Skin tone {modules.globals.tone_match:.1f} ", font=("Arial", 16))
+    tone_label.pack(side='left', padx=5, pady=5)
+    def update_tone(value):
+        modules.globals.tone_match = round(float(value), 1)
+        tone_label.configure(text=f" | Skin tone {modules.globals.tone_match:.1f} ")
+    tone_slider = ctk.CTkSlider(realism_frame, from_=0, to=1, number_of_steps=10, width=120, command=update_tone)
+    tone_slider.set(modules.globals.tone_match)
+    tone_slider.pack(side='left', padx=5, pady=5)
+
+    ctk.CTkLabel(realism_frame, text=" | Swap res ", font=("Arial", 16)).pack(side='left', padx=5, pady=5)
+    swap_res_var = ctk.StringVar(value=str(modules.globals.swap_resolution))
+    ctk.CTkOptionMenu(realism_frame, values=['128', '256', '512'], variable=swap_res_var, width=70,
+                      command=lambda value: setattr(modules.globals, 'swap_resolution', int(value))).pack(side='left', padx=5, pady=5)
+
+    average_var = ctk.BooleanVar(value=modules.globals.average_source_faces)
+    ctk.CTkSwitch(realism_frame, text='Average source faces', variable=average_var, cursor='hand2',
+                  command=lambda: setattr(modules.globals, 'average_source_faces', average_var.get())).pack(side='left', padx=10, pady=5)
+
+    smooth_var = ctk.BooleanVar(value=modules.globals.temporal_smoothing)
+    ctk.CTkSwitch(realism_frame, text='Anti-jitter', variable=smooth_var, cursor='hand2',
+                  command=lambda: setattr(modules.globals, 'temporal_smoothing', smooth_var.get())).pack(side='left', padx=10, pady=5)
 
     preview_label_cam = ctk.CTkLabel(preview, text=None)
     preview_label_cam.pack(fill='y', expand=True)
 
     # Double-click event handling
     is_switch_frame_visible = True
+    realism_height = realism_frame.winfo_reqheight()
 
     def on_double_click(event):
         nonlocal is_switch_frame_visible
-        if is_switch_frame_visible:
-            # Hide the switch_frame by setting its height to 0
-            switch_frame.pack_propagate(False)  # Allow manual height adjustment
-            switch_frame.configure(height=0)  # Use 'configure' instead of 'config'
-        else:
-            # Restore the switch_frame to its original height
-            switch_frame.pack_propagate(True)  # Restore automatic height adjustment
-            switch_frame.configure(height=original_height)  # Use 'configure' instead of 'config'
+        for frame, height in ((switch_frame, original_height), (realism_frame, realism_height)):
+            if is_switch_frame_visible:
+                # Hide the toolbar by setting its height to 0
+                frame.pack_propagate(False)  # Allow manual height adjustment
+                frame.configure(height=0)  # Use 'configure' instead of 'config'
+            else:
+                # Restore the toolbar to its original height
+                frame.pack_propagate(True)  # Restore automatic height adjustment
+                frame.configure(height=height)  # Use 'configure' instead of 'config'
         is_switch_frame_visible = not is_switch_frame_visible
 
     preview.bind("<Double-Button-1>", on_double_click)  # Bind double-click event <button class="citation-flag" data-index="2">
@@ -1188,7 +1212,7 @@ def update_preview(frame_number: int = 0) -> None:
             faces = get_many_faces(source_image)
             if faces:
                 # sort faces from left to right then slice max 10
-                source_images = sorted(faces, key=lambda face: face.bbox[0])[:20]
+                source_images = prepare_source_faces(sorted(faces, key=lambda face: face.bbox[0])[:20])
 
         # no face found
         if not source_images:
@@ -1317,15 +1341,19 @@ def webcam_preview():
             return 180
         return None
 
+    averaged_source = prepare_source_faces(source_images, average=True)
+
     def swap_stage(frame, check_rotation):
         """Stage 1 (worker thread): detection + swap. Face restoration is deferred to stage 2."""
         new_rot = detect_rotation(frame) if check_rotation else None
         if new_rot is not None:
             modules.globals.face_rot_range = new_rot
+        # 'Average source faces' can be toggled while Live runs
+        faces = averaged_source if modules.globals.average_source_faces else source_images
         begin_deferred_restore()
         try:
             for frame_processor in frame_processors:
-                frame = frame_processor.process_frame(source_images, frame)
+                frame = frame_processor.process_frame(faces, frame)
         finally:
             kps_list = end_deferred_restore()
         return frame, kps_list, new_rot
@@ -1342,6 +1370,8 @@ def webcam_preview():
     fps = 0
     rotation_check_counter = 0
 
+    modules.globals.live_mode = True
+    face_swapper_module.FACE_SMOOTHER.reset()
     grabber = CameraGrabber(lambda: camera)
     swap_worker = ThreadPoolExecutor(max_workers=1)
     restore_worker = ThreadPoolExecutor(max_workers=1)
@@ -1404,7 +1434,7 @@ def webcam_preview():
             target_face10_value.configure(text=f': {modules.globals.target_face10_score:.2f}')
 
         current_width = PREVIEW.winfo_width()
-        current_height = PREVIEW.winfo_height()
+        current_height = max(1, PREVIEW.winfo_height() - preview_label_cam.winfo_y())  # space below the toolbars
 
         display_frame = fit_image_to_preview(processed_frame, current_width, current_height)
         image = Image.fromarray(cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB))
@@ -1425,6 +1455,7 @@ def webcam_preview():
     grabber.stop()
     swap_worker.shutdown(wait=True)
     restore_worker.shutdown(wait=True)
+    modules.globals.live_mode = False
     with CAMERA_LOCK:
         camera.release()
     PREVIEW.withdraw()
