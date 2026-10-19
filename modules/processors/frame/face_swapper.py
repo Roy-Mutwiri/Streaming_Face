@@ -91,6 +91,8 @@ def pre_check() -> bool:
         'https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/inswapper_128.onnx',
         'https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/gpen_bfr_256.onnx',
         'https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/gpen_bfr_512.onnx',
+        'https://github.com/facefusion/facefusion-assets/releases/download/models-3.1.0/xseg_1.onnx',
+        'https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/bisenet_resnet_34.onnx',
     ])
     return True
 
