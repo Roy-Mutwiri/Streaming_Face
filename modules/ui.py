@@ -1288,232 +1288,248 @@ def webcam_preview():
     PREVIEW_WIDTH = 1100
     PREVIEW_HEIGHT = 670
     camera_index = modules.globals.camera_index
-    camera = cv2.VideoCapture(camera_index)
-    update_camera_resolution()
+    try:
+        camera = cv2.VideoCapture(camera_index)
+        update_camera_resolution()
     
-    # Configure preview
-    PREVIEW.deiconify()
-    PREVIEW.geometry(f"{PREVIEW_WIDTH}x{PREVIEW_HEIGHT}")
-    preview_label_cam.configure(width=PREVIEW_WIDTH, height=PREVIEW_HEIGHT)
-    frame_processors = get_frame_processors_modules(modules.globals.frame_processors)
+        # Configure preview
+        PREVIEW.deiconify()
+        PREVIEW.geometry(f"{PREVIEW_WIDTH}x{PREVIEW_HEIGHT}")
+        # A previous Live session's image is gone; drop the label's reference before reconfiguring it
+        preview_label_cam._label.configure(image='')
+        preview_label_cam.configure(width=PREVIEW_WIDTH, height=PREVIEW_HEIGHT)
+        frame_processors = get_frame_processors_modules(modules.globals.frame_processors)
     
-    if modules.globals.face_tracking:
-        for frame_processor in frame_processors:
-            if hasattr(frame_processor, 'reset_face_tracking'):
-                    frame_processor.reset_face_tracking()
+        if modules.globals.face_tracking:
+            for frame_processor in frame_processors:
+                if hasattr(frame_processor, 'reset_face_tracking'):
+                        frame_processor.reset_face_tracking()
 
-    # Initialize source_images
-    source_images: List[Face] = []
-    if modules.globals.source_path:
-        source_image = cv2.imread(modules.globals.source_path)
-        faces = get_many_faces(source_image)
-        if faces:
-            source_images = sorted(faces, key=lambda face: face.bbox[0])[:20]
+        # Initialize source_images
+        source_images: List[Face] = []
+        if modules.globals.source_path:
+            source_image = cv2.imread(modules.globals.source_path)
+            faces = get_many_faces(source_image)
+            if faces:
+                source_images = sorted(faces, key=lambda face: face.bbox[0])[:20]
     
-    if not source_images:
-        print('No face found in source image')
+        if not source_images:
+            print('No face found in source image')
+            if enhancer_switch:
+                enhancer_switch.configure(state="normal")
+                if previous_enhancer_state:
+                    enhancer_switch.select()
+                    update_tumbler('face_enhancer', True)
+            return
+        else:
+            num_faces = len(source_images)
+            dropdown_values = ["-1"] + [str(i) for i in range(num_faces)]
+            dropdown2_values = [str(i) for i in range(num_faces)]
+        
+            modules.globals.face_index_dropdown_preview.configure(values=dropdown_values)
+            modules.globals.face2_index_dropdown_preview.configure(values=dropdown2_values)
+            # Reset Face 1 (F1) to Auto (-1)
+            modules.globals.face_index_var.set("-1")
+            modules.globals.face_index_range = -1
+
+            # Reset Face 2 (F2) to First Face (0)
+            modules.globals.face2_index_var.set("0")
+            modules.globals.face2_index_range = 0
+
+            for frame_processor in frame_processors:
+                 if hasattr(frame_processor, 'extract_face_embedding'):
+                    source_embeddings = []
+                    for face in source_images:
+                         source_embeddings.append(frame_processor.extract_face_embedding(face))
+                    modules.globals.source_face_left_embedding=source_embeddings
+
+        from modules.processors.frame.face_swapper import estimate_head_rotation, begin_deferred_restore, end_deferred_restore
+        import modules.processors.frame.face_swapper as face_swapper_module
+        import modules.background as background_module
+        from modules.face_restore import restore_faces
+
+        def detect_rotation(frame):
+            """Auto rotation: returns the new rotation, or None if no face was found."""
+            # When upright, the swap stage already detected faces on this orientation, so reuse them
+            faces = face_swapper_module.cached_detected_faces if modules.globals.face_rot_range == 0 else None
+            if not faces:
+                faces = get_many_faces_fast(frame)
+            if faces:
+                main_face = max(faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]))
+                angle = estimate_head_rotation(main_face)
+                if angle > 60:
+                    return -90
+                if angle < -60:
+                    return 90
+                return 0
+            # The detector usually fails on upside down faces, so flip and check
+            if get_many_faces_fast(cv2.rotate(frame, cv2.ROTATE_180)):
+                return 180
+            return None
+
+        averaged_source = prepare_source_faces(source_images, average=True)
+
+        def detect_stage(frame, check_rotation):
+            """Stage 1 (worker thread): auto-rotation + face detection, one frame ahead of the swap."""
+            new_rot = detect_rotation(frame) if check_rotation else None
+            if new_rot is not None:
+                modules.globals.face_rot_range = new_rot
+            # Person matte for the virtual background, from the camera frame before the swap,
+            # computed in parallel with face detection
+            matte = background_module.MATTE_POOL.submit(background_module.MATTER, frame) if modules.globals.live_background != 'None' else None
+            detected = face_swapper_module.detect_frame_faces(frame)
+            return frame, detected, new_rot, matte.result() if matte else None
+
+        def swap_stage(detect_future):
+            """Stage 2 (worker thread): swap. Face restoration is deferred to stage 3."""
+            frame, detected, new_rot, alpha = detect_future.result()
+            # 'Average source faces' can be toggled while Live runs
+            faces = averaged_source if modules.globals.average_source_faces else source_images
+            begin_deferred_restore()
+            try:
+                for frame_processor in frame_processors:
+                    if frame_processor is face_swapper_module:
+                        frame = frame_processor.process_frame(faces, frame, detected)
+                    else:
+                        frame = frame_processor.process_frame(faces, frame)
+            finally:
+                kps_list = end_deferred_restore()
+            return frame, kps_list, new_rot, alpha
+
+        def restore_stage(swap_future):
+            """Stage 3 (worker thread): GPEN restoration, overlapping the next frames."""
+            frame, kps_list, new_rot, alpha = swap_future.result()
+            if modules.globals.live_enhancer != 'Off' and kps_list:
+                frame = restore_faces(frame, kps_list)
+            return frame, new_rot, alpha
+
+        def background_stage(restore_future):
+            """Stage 4 (worker thread): virtual background composite."""
+            frame, new_rot, alpha = restore_future.result()
+            if alpha is not None:
+                frame = background_module.compose(frame, alpha)
+            return frame, new_rot
+
+        frame_count = 0
+        start_time = time.time()
+        fps = 0
+        rotation_check_counter = 0
+
+        modules.globals.live_mode = True
+        face_swapper_module.FACE_SMOOTHER.reset()
+        background_module.MATTER.reset()
+        grabber = CameraGrabber(lambda: camera)
+        detect_worker = ThreadPoolExecutor(max_workers=1)
+        swap_worker = ThreadPoolExecutor(max_workers=1)
+        restore_worker = ThreadPoolExecutor(max_workers=1)
+        background_worker = ThreadPoolExecutor(max_workers=1)
+        in_flight = deque()
+        last_frame_id = -1
+        live_photo = None
+        last_label_update = 0.0
+
+        while camera.isOpened():
+            last_frame_id, current_frame = grabber.wait_for_frame(last_frame_id)
+            if current_frame is None:
+                if grabber.failed:
+                    update_status('Camera is not delivering frames. Close other apps using it (OBS, Zoom, a browser, '
+                                  'another copy of this app) or choose another camera, then press Live again.')
+                    break
+                ROOT.update()
+                continue
+
+            if modules.globals.flip_x:
+                current_frame = cv2.flip(current_frame, 1)
+            if modules.globals.flip_y:
+                current_frame = cv2.flip(current_frame, 0)
+
+            check_rotation = modules.globals.auto_rotate_value and rotation_check_counter % modules.globals.rotation_check_interval == 0
+            rotation_check_counter += 1
+
+            # Pipeline: detect frame N, swap N-1, restore N-2 and composite the background of N-3 at once
+            detect_future = detect_worker.submit(detect_stage, current_frame, check_rotation)
+            swap_future = swap_worker.submit(swap_stage, detect_future)
+            restore_future = restore_worker.submit(restore_stage, swap_future)
+            in_flight.append(background_worker.submit(background_stage, restore_future))
+            if len(in_flight) < 4:
+                continue
+            processed_frame, new_rot = in_flight.popleft().result()
+
+            if new_rot is not None:
+                if modules.globals.rot_range_var and modules.globals.rot_range_var.get() != str(new_rot):
+                    modules.globals.rot_range_var.set(str(new_rot))
+                if modules.globals.rot_range_dropdown_preview:
+                    modules.globals.rot_range_dropdown_preview.set(str(new_rot))
+
+            # FPS
+            frame_count += 1
+            current_time = time.time()
+            elapsed_time = current_time - start_time
+            if elapsed_time > 1:
+                fps = frame_count / elapsed_time
+                frame_count = 0
+                start_time = current_time
+                fps_label.configure(text=f'FPS: {fps:.2f}')
+
+            # UI Updates (a few times per second is plenty; reconfiguring labels every frame is slow in Tk)
+            if current_time - last_label_update > 0.2:
+                last_label_update = current_time
+                target_face1_value.configure(text=f': {modules.globals.target_face1_score:.2f}')
+                target_face2_value.configure(text=f': {modules.globals.target_face2_score:.2f}')
+                target_face3_value.configure(text=f': {modules.globals.target_face3_score:.2f}')
+                target_face4_value.configure(text=f': {modules.globals.target_face4_score:.2f}')
+                target_face5_value.configure(text=f': {modules.globals.target_face5_score:.2f}')
+                target_face6_value.configure(text=f': {modules.globals.target_face6_score:.2f}')
+                target_face7_value.configure(text=f': {modules.globals.target_face7_score:.2f}')
+                target_face8_value.configure(text=f': {modules.globals.target_face8_score:.2f}')
+                target_face9_value.configure(text=f': {modules.globals.target_face9_score:.2f}')
+                target_face10_value.configure(text=f': {modules.globals.target_face10_score:.2f}')
+
+            current_width = PREVIEW.winfo_width()
+            current_height = max(1, PREVIEW.winfo_height() - preview_label_cam.winfo_y())  # space below the toolbars
+
+            display_frame = fit_image_to_preview(processed_frame, current_width, current_height)
+            image = Image.fromarray(cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB))
+
+            # Reuse one Tk photo image and paste new pixels into it. Creating a CTkImage per frame
+            # re-resizes the whole picture in PIL and allocates a new Tk image, which capped the FPS.
+            if live_photo is None or (live_photo.width(), live_photo.height()) != (current_width, current_height):
+                live_photo = ImageTk.PhotoImage(image)
+                preview_label_cam.configure(width=current_width, height=current_height)
+                preview_label_cam._label.configure(image=live_photo)
+            else:
+                live_photo.paste(image)
+            ROOT.update()
+        
+            if PREVIEW.state() == 'withdrawn':
+                break
+
+        grabber.stop()
+        detect_worker.shutdown(wait=True)
+        swap_worker.shutdown(wait=True)
+        restore_worker.shutdown(wait=True)
+        background_worker.shutdown(wait=True)
+        modules.globals.live_mode = False
+        with CAMERA_LOCK:
+            camera.release()
+        PREVIEW.withdraw()
+
         if enhancer_switch:
             enhancer_switch.configure(state="normal")
             if previous_enhancer_state:
                 enhancer_switch.select()
                 update_tumbler('face_enhancer', True)
-        return
-    else:
-        num_faces = len(source_images)
-        dropdown_values = ["-1"] + [str(i) for i in range(num_faces)]
-        dropdown2_values = [str(i) for i in range(num_faces)]
-        
-        modules.globals.face_index_dropdown_preview.configure(values=dropdown_values)
-        modules.globals.face2_index_dropdown_preview.configure(values=dropdown2_values)
-        # Reset Face 1 (F1) to Auto (-1)
-        modules.globals.face_index_var.set("-1")
-        modules.globals.face_index_range = -1
-
-        # Reset Face 2 (F2) to First Face (0)
-        modules.globals.face2_index_var.set("0")
-        modules.globals.face2_index_range = 0
-
-        for frame_processor in frame_processors:
-             if hasattr(frame_processor, 'extract_face_embedding'):
-                source_embeddings = []
-                for face in source_images:
-                     source_embeddings.append(frame_processor.extract_face_embedding(face))
-                modules.globals.source_face_left_embedding=source_embeddings
-
-    from modules.processors.frame.face_swapper import estimate_head_rotation, begin_deferred_restore, end_deferred_restore
-    import modules.processors.frame.face_swapper as face_swapper_module
-    import modules.background as background_module
-    from modules.face_restore import restore_faces
-
-    def detect_rotation(frame):
-        """Auto rotation: returns the new rotation, or None if no face was found."""
-        # When upright, the swap stage already detected faces on this orientation, so reuse them
-        faces = face_swapper_module.cached_detected_faces if modules.globals.face_rot_range == 0 else None
-        if not faces:
-            faces = get_many_faces_fast(frame)
-        if faces:
-            main_face = max(faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]))
-            angle = estimate_head_rotation(main_face)
-            if angle > 60:
-                return -90
-            if angle < -60:
-                return 90
-            return 0
-        # The detector usually fails on upside down faces, so flip and check
-        if get_many_faces_fast(cv2.rotate(frame, cv2.ROTATE_180)):
-            return 180
-        return None
-
-    averaged_source = prepare_source_faces(source_images, average=True)
-
-    def detect_stage(frame, check_rotation):
-        """Stage 1 (worker thread): auto-rotation + face detection, one frame ahead of the swap."""
-        new_rot = detect_rotation(frame) if check_rotation else None
-        if new_rot is not None:
-            modules.globals.face_rot_range = new_rot
-        # Person matte for the virtual background, from the camera frame before the swap,
-        # computed in parallel with face detection
-        matte = background_module.MATTE_POOL.submit(background_module.MATTER, frame) if modules.globals.live_background != 'None' else None
-        detected = face_swapper_module.detect_frame_faces(frame)
-        return frame, detected, new_rot, matte.result() if matte else None
-
-    def swap_stage(detect_future):
-        """Stage 2 (worker thread): swap. Face restoration is deferred to stage 3."""
-        frame, detected, new_rot, alpha = detect_future.result()
-        # 'Average source faces' can be toggled while Live runs
-        faces = averaged_source if modules.globals.average_source_faces else source_images
-        begin_deferred_restore()
+    finally:
+        # Always give the camera back, also when Live ends early or with an error
+        modules.globals.live_mode = False
+        if camera is not None:
+            with CAMERA_LOCK:
+                camera.release()
         try:
-            for frame_processor in frame_processors:
-                if frame_processor is face_swapper_module:
-                    frame = frame_processor.process_frame(faces, frame, detected)
-                else:
-                    frame = frame_processor.process_frame(faces, frame)
-        finally:
-            kps_list = end_deferred_restore()
-        return frame, kps_list, new_rot, alpha
+            preview_label_cam._label.configure(image='')
+        except Exception:
+            pass
 
-    def restore_stage(swap_future):
-        """Stage 3 (worker thread): GPEN restoration, overlapping the next frames."""
-        frame, kps_list, new_rot, alpha = swap_future.result()
-        if modules.globals.live_enhancer != 'Off' and kps_list:
-            frame = restore_faces(frame, kps_list)
-        return frame, new_rot, alpha
-
-    def background_stage(restore_future):
-        """Stage 4 (worker thread): virtual background composite."""
-        frame, new_rot, alpha = restore_future.result()
-        if alpha is not None:
-            frame = background_module.compose(frame, alpha)
-        return frame, new_rot
-
-    frame_count = 0
-    start_time = time.time()
-    fps = 0
-    rotation_check_counter = 0
-
-    modules.globals.live_mode = True
-    face_swapper_module.FACE_SMOOTHER.reset()
-    background_module.MATTER.reset()
-    grabber = CameraGrabber(lambda: camera)
-    detect_worker = ThreadPoolExecutor(max_workers=1)
-    swap_worker = ThreadPoolExecutor(max_workers=1)
-    restore_worker = ThreadPoolExecutor(max_workers=1)
-    background_worker = ThreadPoolExecutor(max_workers=1)
-    in_flight = deque()
-    last_frame_id = -1
-    live_photo = None
-    last_label_update = 0.0
-
-    while camera.isOpened():
-        last_frame_id, current_frame = grabber.wait_for_frame(last_frame_id)
-        if current_frame is None:
-            if grabber.failed:
-                break
-            ROOT.update()
-            continue
-
-        if modules.globals.flip_x:
-            current_frame = cv2.flip(current_frame, 1)
-        if modules.globals.flip_y:
-            current_frame = cv2.flip(current_frame, 0)
-
-        check_rotation = modules.globals.auto_rotate_value and rotation_check_counter % modules.globals.rotation_check_interval == 0
-        rotation_check_counter += 1
-
-        # Pipeline: detect frame N, swap N-1, restore N-2 and composite the background of N-3 at once
-        detect_future = detect_worker.submit(detect_stage, current_frame, check_rotation)
-        swap_future = swap_worker.submit(swap_stage, detect_future)
-        restore_future = restore_worker.submit(restore_stage, swap_future)
-        in_flight.append(background_worker.submit(background_stage, restore_future))
-        if len(in_flight) < 4:
-            continue
-        processed_frame, new_rot = in_flight.popleft().result()
-
-        if new_rot is not None:
-            if modules.globals.rot_range_var and modules.globals.rot_range_var.get() != str(new_rot):
-                modules.globals.rot_range_var.set(str(new_rot))
-            if modules.globals.rot_range_dropdown_preview:
-                modules.globals.rot_range_dropdown_preview.set(str(new_rot))
-
-        # FPS
-        frame_count += 1
-        current_time = time.time()
-        elapsed_time = current_time - start_time
-        if elapsed_time > 1:
-            fps = frame_count / elapsed_time
-            frame_count = 0
-            start_time = current_time
-            fps_label.configure(text=f'FPS: {fps:.2f}')
-
-        # UI Updates (a few times per second is plenty; reconfiguring labels every frame is slow in Tk)
-        if current_time - last_label_update > 0.2:
-            last_label_update = current_time
-            target_face1_value.configure(text=f': {modules.globals.target_face1_score:.2f}')
-            target_face2_value.configure(text=f': {modules.globals.target_face2_score:.2f}')
-            target_face3_value.configure(text=f': {modules.globals.target_face3_score:.2f}')
-            target_face4_value.configure(text=f': {modules.globals.target_face4_score:.2f}')
-            target_face5_value.configure(text=f': {modules.globals.target_face5_score:.2f}')
-            target_face6_value.configure(text=f': {modules.globals.target_face6_score:.2f}')
-            target_face7_value.configure(text=f': {modules.globals.target_face7_score:.2f}')
-            target_face8_value.configure(text=f': {modules.globals.target_face8_score:.2f}')
-            target_face9_value.configure(text=f': {modules.globals.target_face9_score:.2f}')
-            target_face10_value.configure(text=f': {modules.globals.target_face10_score:.2f}')
-
-        current_width = PREVIEW.winfo_width()
-        current_height = max(1, PREVIEW.winfo_height() - preview_label_cam.winfo_y())  # space below the toolbars
-
-        display_frame = fit_image_to_preview(processed_frame, current_width, current_height)
-        image = Image.fromarray(cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB))
-
-        # Reuse one Tk photo image and paste new pixels into it. Creating a CTkImage per frame
-        # re-resizes the whole picture in PIL and allocates a new Tk image, which capped the FPS.
-        if live_photo is None or (live_photo.width(), live_photo.height()) != (current_width, current_height):
-            live_photo = ImageTk.PhotoImage(image)
-            preview_label_cam.configure(width=current_width, height=current_height)
-            preview_label_cam._label.configure(image=live_photo)
-        else:
-            live_photo.paste(image)
-        ROOT.update()
-        
-        if PREVIEW.state() == 'withdrawn':
-            break
-
-    grabber.stop()
-    detect_worker.shutdown(wait=True)
-    swap_worker.shutdown(wait=True)
-    restore_worker.shutdown(wait=True)
-    background_worker.shutdown(wait=True)
-    modules.globals.live_mode = False
-    with CAMERA_LOCK:
-        camera.release()
-    PREVIEW.withdraw()
-
-    if enhancer_switch:
-        enhancer_switch.configure(state="normal")
-        if previous_enhancer_state:
-            enhancer_switch.select()
-            update_tumbler('face_enhancer', True)
 
 def fit_image_to_preview(image, preview_width, preview_height):
     h, w = image.shape[:2]
