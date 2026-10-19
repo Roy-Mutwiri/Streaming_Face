@@ -18,3 +18,9 @@ models/trt_cache/
 # Your own virtual backgrounds (only the README is tracked)
 backgrounds/*
 !backgrounds/README.txt
+
+# Auto-push watcher state
+tools/auto_push.log
+tools/auto_push.log.old
+tools/auto_push.pid
+.autopush-pause
